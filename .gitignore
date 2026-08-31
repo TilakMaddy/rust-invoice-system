@@ -1,0 +1,14 @@
+.claude/
+
+# Build artifacts
+target/
+
+# Backtraces emitted by panics
+rustc-ice-*.txt
+
+# macOS
+.DS_Store
+
+# sqlx-cli reads DATABASE_URL from here. Local-only: each developer's differs, and Compose
+# passes its own to the container.
+.env

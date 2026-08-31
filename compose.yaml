@@ -1,0 +1,92 @@
+name: rust-invoice-system
+
+services:
+  business:
+    build: ./business
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3001
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/business
+      # What the binary falls back to on its own, spelled out because this is the knob to reach
+      # for. `business=info` drops the per-request detail and keeps the state changes; `warn`
+      # leaves only the things that need looking at. Raising anything else -- `sqlx=debug`, say --
+      # turns on that crate's own logging, which for sqlx is every statement this service runs.
+      RUST_LOG: warn,business=debug
+      # The compose network name, not localhost: the two services are separate containers.
+      PAYMENT_SERVICE_URL: http://mock-payment-service:3000
+      # Gates the endpoints the business itself operates; the payer's two are open. A literal
+      # here because this file only ever runs a development stack — a deployment would inject
+      # it from a secret store rather than commit it next to the code it protects.
+      BUSINESS_API_KEY: dev-token
+      # Where signed webhooks go, and the key they are signed with. Registration is
+      # configuration: there is no endpoint to create one over HTTP, so adding a receiver is a
+      # change to this file and a restart. The receiver reads the same literals below, which is
+      # the point -- one value in one place, and no registration response to capture. A second
+      # receiver is another entry in this array and another in WEBHOOK_SECRETS; every event fans
+      # out to all of them.
+      #
+      # Literals here for the same reason BUSINESS_API_KEY is one: this file only ever runs a
+      # development stack, and a deployment would inject these from a secret store.
+      WEBHOOK_ENDPOINTS: >-
+        [{"url": "http://webhook-receiver:3002/webhooks",
+          "secret": "whsec_dev_healthy"}]
+    ports:
+      - "3001:3001"
+    # Waiting on the healthchecks rather than on the containers starting is what lets the
+    # service connect straight away, with no retry loop of its own: initdb has finished and
+    # Postgres is accepting connections before this is scheduled at all. The payment service is
+    # gated the same way, so the background jobs' pass at startup has something to talk to.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-payment-service:
+        condition: service_healthy
+      # Not because delivery would fail without it -- a refused connection is just a retry, which
+      # is the whole point of the outbox. It is gated so that `just demo` does not have to
+      # explain why its first delivery attempt was the one that failed.
+      webhook-receiver:
+        condition: service_healthy
+
+  mock-payment-service:
+    build: ./mock-payment-service
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "3000:3000"
+
+  # The receiving end of the webhooks, and the reference implementation of verifying one. Its
+  # secret is the same literal the business signs with above.
+  webhook-receiver:
+    build: ./webhook-receiver
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3002
+      WEBHOOK_SECRETS: >-
+        [{"path": "/webhooks", "secret": "whsec_dev_healthy"}]
+    ports:
+      - "3002:3002"
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      # Read by initdb, and only on a first boot against an empty volume: changing it later
+      # does nothing until the volume is wiped with `just reset-db`. It also creates exactly
+      # one database — when a second service needs its own, move to a script mounted at
+      # /docker-entrypoint-initdb.d/ that CREATE DATABASEs each of them.
+      POSTGRES_DB: business
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d business"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  postgres-data:

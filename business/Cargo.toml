@@ -1,0 +1,52 @@
+[package]
+name = "business"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+# Webhook signing. The four-lines-not-a-crate rule that `auth` and `idempotency` follow stops at
+# crypto: `idempotency` can hash in Postgres because the input is a request it already sends
+# there, but a signing key has no business crossing the wire to the database or landing in a
+# statement log — and signing in-process saves a round trip on every delivery attempt.
+hmac = "0.12"
+# Default features off drops reqwest's TLS stacks, its HTTP/2 support and charset sniffing:
+# the PSP is reached over plain http on the compose network, and only JSON bodies are read.
+# The same tradeoff sqlx makes below — a PAYMENT_SERVICE_URL asking for https:// will fail
+# until a tls feature is added.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# Default features off drops sqlx's TLS stacks and the `any` driver: this service talks to a
+# Postgres container over the compose network, so there is nothing to encrypt. The tradeoff is
+# that a DATABASE_URL asking for `sslmode=require` will fail until a tls-* feature is added.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "migrate",
+] }
+# `time` is what bounds a charge: the timeout around the PSP call, and the interval the daily
+# background jobs tick on. Nothing in the crate needed a timer before.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+# Already in the lock file as a transitive dependency of axum, sqlx and hyper, so taking it
+# directly costs no extra compilation -- only the macros this crate now calls itself.
+tracing = "0.1"
+# `env-filter` on top of the defaults, which is what reads RUST_LOG. The defaults also bring the
+# `tracing-log` bridge, so sqlx's and reqwest's `log` records land in the same output -- see the
+# filter `logging::init` falls back to for why everything outside this crate starts at `warn`.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
+
+[dev-dependencies]
+# The stub PSP in tests/pay.rs drops a connection mid-response the way mock-payment-service
+# does: a response body stream that errors on its first poll.
+futures-util = { version = "0.3", default-features = false }
+http-body-util = "0.1"
+# `sync` on top of what the crate itself uses, for one thing: the barrier the stub PSP holds a
+# burst of charges at. A concurrency test that lets its requests trickle into `payments::claim`
+# proves nothing -- each one finds the invoice already taken, and a claim with no row lock at
+# all passes it. Test-only, so a normal build does not pull it in.
+tokio = { version = "1", features = ["sync"] }
+tower = { version = "0.5", features = ["util"] }

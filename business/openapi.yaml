@@ -1,0 +1,836 @@
+openapi: 3.1.0
+
+info:
+  title: rust-invoice-system — business API
+  version: "1.0.0"
+  description: |
+    Invoicing, charging and event delivery.
+
+    ## Two audiences, one port
+
+    Which endpoints need a token is decided by **who is asking**, not by whether the request
+    writes. `GET /invoices` is gated and `POST /invoices/{id}/pay` is not, because raising or
+    voiding an invoice is the business's own affair, while whoever is being billed has no token
+    and cannot be given one.
+
+    - **Operator** — the business's back office. Requires `X-API-Token`.
+    - **Payer** — the person being billed. `POST /invoices/{id}/pay` and
+      `GET /payment_intents/{id}`, both open by necessity. Neither exposes anything about an
+      invoice beyond the charge the caller is already making.
+    - **Docker** — `GET /health`, open so the container healthcheck can reach it.
+
+    An unauthenticated request to an operator endpoint gets `401 unauthorized`; a *wrong* token
+    gets exactly the same, since telling that caller their header was well formed and merely
+    incorrect hands them the one bit they were missing. A path matching no route stays `404`
+    rather than `401`, which would reveal which paths exist.
+
+    ## Error format
+
+    Every failure answers with the same shape, so a caller parses failures one way:
+
+    ```json
+    { "error": "invoice_not_payable" }
+    ```
+
+    One addition, on `POST /invoices/{id}/pay`: once a charge has reached the payment service, every
+    answer also carries `payment_intent_id`, the handle to that attempt. The `error` is still
+    there and still parses the same way — the id rides alongside it, because following it is how
+    a caller reads back where the money went. Its `200` is the only response on the endpoint with
+    no `error`, being the only one that is not a failure.
+
+    A body that cannot be deserialized at all — a missing field, or a string where a number
+    belongs — is rejected by the framework before a handler runs, in its own plain-text format.
+
+    ## Money and identifiers
+
+    Amounts are integer **minor units** (`total_cents`), never floats. Ids are uuidv7 except
+    `payment_intent_id`, which is the payment service's own `pi_…` string. Timestamps are UTC
+    ISO-8601, `YYYY-MM-DDTHH:MM:SSZ`.
+
+servers:
+  # Relative, and it has to be. An absolute URL here is the origin Swagger UI's "Try it out"
+  # posts to, and a browser treats `localhost` and `127.0.0.1` as *different origins* — so a
+  # page opened on one and pointed at the other has its requests blocked, with no CORS headers
+  # to rescue them. A relative URL resolves against wherever the page was loaded from, which is
+  # the same binary that serves this file, so it is right for every host it is ever reached on.
+  - url: /
+    description: This server
+
+tags:
+  - name: Customers
+    description: Operator. Who gets billed.
+  - name: Invoices
+    description: Operator. Raising invoices and moving them through their lifecycle.
+  - name: Payments
+    description: Payer. Charging an invoice, and finding out what became of a charge.
+  - name: Webhooks
+    description: Operator. What was emitted, who it was owed to, and how delivery went.
+  - name: Health
+    description: Open.
+  - name: Documentation
+    description: |
+      Open. This description, and the viewer that renders it — both embedded in the binary, so
+      they work with no network access.
+
+paths:
+  /customers:
+    post:
+      tags: [Customers]
+      summary: Create a customer
+      operationId: createCustomer
+      security: [{ operatorToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateCustomer" }
+            example: { name: "Acme Corp", email: "billing@acme.test" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Customer" }
+        "400":
+          description: "`invalid_customer` — name or email is blank."
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: "`email_already_exists` — email is unique across customers."
+          $ref: "#/components/responses/Error"
+        "500": { $ref: "#/components/responses/Internal" }
+    get:
+      tags: [Customers]
+      summary: List every customer
+      operationId: listCustomers
+      security: [{ operatorToken: [] }]
+      responses:
+        "200":
+          description: All customers, ordered by id (so, by creation).
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Customer" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /customers/{id}:
+    get:
+      tags: [Customers]
+      summary: Read one customer
+      operationId: getCustomer
+      security: [{ operatorToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/CustomerId" }]
+      responses:
+        "200":
+          description: The customer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Customer" }
+        "400":
+          description: "`invalid_customer_id` — not a uuid."
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`customer_not_found`"
+          $ref: "#/components/responses/Error"
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /invoices:
+    post:
+      tags: [Invoices]
+      summary: Raise an invoice
+      operationId: createInvoice
+      description: |
+        The caller sends line items and the server totals them; there is no way to supply a total
+        directly, so the number stored can never disagree with the lines it came from. The line
+        items themselves are **not persisted** — they are input to the sum and then discarded.
+
+        A new invoice is always `draft`. Emits `invoice.created`.
+      security: [{ operatorToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateInvoice" }
+            example:
+              customer_id: "01a04ca6-d4e4-7e81-b6dc-41d699f8fa25"
+              due_date: "2026-10-01"
+              line_items:
+                - { description: "Consulting", quantity: 2, unit_amount_cents: 50000 }
+                - { description: "Support", quantity: 1, unit_amount_cents: 2500 }
+      responses:
+        "201":
+          description: Created, in state `draft`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invoice" }
+        "400":
+          description: |
+            `no_line_items` — the array is empty.
+            `invalid_line_item` — blank description, `quantity <= 0`, or a negative unit amount.
+            `total_too_large` — the sum overflows a 64-bit integer.
+            `invalid_due_date` — not `YYYY-MM-DD`, or not a real calendar day.
+            `invalid_customer_id` — not a uuid.
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`customer_not_found` — the body is well formed, the customer is not there."
+          $ref: "#/components/responses/Error"
+        "500": { $ref: "#/components/responses/Internal" }
+    get:
+      tags: [Invoices]
+      summary: List invoices
+      operationId: listInvoices
+      security: [{ operatorToken: [] }]
+      parameters:
+        - name: state
+          in: query
+          required: false
+          description: Return only invoices in this state. Omit for all of them.
+          schema: { $ref: "#/components/schemas/InvoiceState" }
+      responses:
+        "200":
+          description: Matching invoices, ordered by id.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Invoice" }
+        "400":
+          description: "`invalid_invoice_state` — not one of the five states."
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /invoices/{id}:
+    get:
+      tags: [Invoices]
+      summary: Read one invoice
+      operationId: getInvoice
+      security: [{ operatorToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/InvoiceId" }]
+      responses:
+        "200":
+          description: The invoice.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invoice" }
+        "400":
+          description: "`invalid_invoice_id`"
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`invoice_not_found`"
+          $ref: "#/components/responses/Error"
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /invoices/{id}/ready:
+    post:
+      tags: [Invoices]
+      summary: Finalize a draft
+      operationId: readyInvoice
+      description: |
+        `draft -> ready`, marking the invoice settled enough to be charged. Only `draft` qualifies.
+      security: [{ operatorToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/InvoiceId" }]
+      responses:
+        "200": { $ref: "#/components/responses/InvoiceMoved" }
+        "400":
+          description: "`invalid_invoice_id`"
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`invoice_not_found`"
+          $ref: "#/components/responses/Error"
+        "409":
+          description: |
+            `invoice_not_draft` — the invoice is in some other state.
+            `invoice_locked` — another transition held the row past the 100 ms lock timeout.
+            Retryable.
+          $ref: "#/components/responses/Error"
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /invoices/{id}/draft:
+    post:
+      tags: [Invoices]
+      summary: Reopen a finalized invoice for editing
+      operationId: draftInvoice
+      description: |
+        `ready -> draft`. Only `ready` qualifies: `processing`, `processed` and `void` have all
+        been acted on, and reopening one would let the figures drift from what was charged or
+        written off. This is the only reversible transition in the system.
+      security: [{ operatorToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/InvoiceId" }]
+      responses:
+        "200": { $ref: "#/components/responses/InvoiceMoved" }
+        "400":
+          description: "`invalid_invoice_id`"
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`invoice_not_found`"
+          $ref: "#/components/responses/Error"
+        "409":
+          description: "`invoice_not_ready`, or `invoice_locked`."
+          $ref: "#/components/responses/Error"
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /invoices/{id}/void:
+    post:
+      tags: [Invoices]
+      summary: Write off an invoice
+      operationId: voidInvoice
+      description: |
+        `draft -> void` or `ready -> void` — the two states where nothing has been charged.
+        `processing` is excluded because a charge is in flight and voiding would race the payment
+        service's answer; `processed` because the money already moved, and cancelling that is a
+        refund, not a void. `void` is terminal.
+      security: [{ operatorToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/InvoiceId" }]
+      responses:
+        "200": { $ref: "#/components/responses/InvoiceMoved" }
+        "400":
+          description: "`invalid_invoice_id`"
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: "`invoice_not_found`"
+          $ref: "#/components/responses/Error"
+        "409":
+          description: "`invoice_not_voidable`, or `invoice_locked`."
+          $ref: "#/components/responses/Error"
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /invoices/{id}/pay:
+    post:
+      tags: [Payments]
+      summary: Charge a ready invoice
+      operationId: payInvoice
+      security: []
+      description: |
+        **No `X-API-Token`** — this is the payer's endpoint.
+
+        **`Idempotency-Key` is required, not optional.** A charge with no key is a charge nobody
+        can safely retry, and letting one through would make the protection depend on the caller
+        remembering to ask for it, on the one endpoint where forgetting bills someone twice.
+
+        The guarantee is exact and has no expiry: **one key, one response, forever.** The first
+        request under a key is charged and its answer recorded; every later request under that
+        key is handed that same answer back verbatim, whatever its status. A caller who wants a
+        genuinely new attempt uses a new key.
+
+        Concurrency is settled by a row lock whose state test is inside the locking statement, so
+        of N simultaneous charges of one invoice **at most one is charged** and the rest get
+        `409 invoice_not_payable`.
+
+        **An unresolved charge is left unresolved.** If the payment service never answers, the
+        invoice stays `processing` still pointing at its intent and nothing is written, because
+        the card may already have been charged. Follow `GET /payment_intents/{id}`; a daily
+        reconciler closes it out.
+
+        Emits `invoice.paid` or `invoice.payment_failed` once the outcome is recorded.
+      parameters:
+        - $ref: "#/components/parameters/InvoiceId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Any non-empty string, unique per intended charge.
+          schema: { type: string, minLength: 1 }
+          example: acme-oct-01
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PayInvoice" }
+            example: { card_token: "tok_success" }
+      responses:
+        "200":
+          description: Charged. The invoice is now `processed`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Attempt" }
+        "400":
+          description: |
+            `idempotency_key_missing` — absent or empty header.
+            `idempotency_key_reused` — this key was already used for a *different* request. A key
+            stands for one request; replaying would answer a question the caller did not ask.
+            `invalid_invoice_id` — not a uuid.
+          $ref: "#/components/responses/Error"
+        "402":
+          description: |
+            `charge_declined` — the payment service declined the card. The invoice returns to
+            `ready` and can be charged again with another card. Carries the intent id alongside
+            the error.
+
+            **Why is not reported.** The payment service separates `insufficient_funds` from
+            `card_declined`; this endpoint answers `charge_declined` to both. The reason belongs
+            between the cardholder and their bank, and putting the payment service's failure
+            vocabulary into this API would make every caller depend on it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AttemptError" }
+        "404":
+          description: "`invoice_not_found`"
+          $ref: "#/components/responses/Error"
+        "409":
+          description: |
+            `invoice_not_payable` — the invoice is not `ready`: still a draft, already paid,
+            voided, or being charged by someone else right now.
+            `idempotency_key_in_flight` — the first request under this key has not finished.
+            Retry the same key once it has.
+          $ref: "#/components/responses/Error"
+        "413":
+          description: "`request_body_too_large` — over 64 KiB."
+          $ref: "#/components/responses/Error"
+        "500":
+          description: |
+            This service's own database failed. **Carries both** `error` and
+            `payment_intent_id`: the charge itself may well have succeeded, and the id is how the
+            caller watches the record catch up.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AttemptError" }
+        "502":
+          description: "`payment_service_unavailable` — the PSP could not be reached. Nothing was charged and no invoice moved."
+          $ref: "#/components/responses/Error"
+        "504":
+          description: |
+            `charge_unresolved` — the charge reached the payment service and no answer came back.
+            **The card may or may not have been charged**, and the code says only that: not that
+            the charge failed, but that this service cannot say either way. The invoice is held
+            in `processing`, and following the intent id is the only way to learn the outcome.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AttemptError" }
+
+  /payment_intents/{id}:
+    get:
+      tags: [Payments]
+      summary: What became of one charge attempt
+      operationId: getPaymentIntent
+      security: []
+      description: |
+        **No `X-API-Token`** — the other half of `POST /invoices/{id}/pay`, for a caller that got
+        a `504` and has no idea whether the card was charged.
+
+        **The recorded row is the answer.** No call to the payment service, no settlement, no
+        side effect of any kind — that row is what the rest of the system acted on. The cost is
+        that `pending` means *this service does not know yet*, not *the card was not charged*; a
+        charge whose response was lost reads `pending` until the daily reconciler settles it.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The payment service's own id.
+          schema: { type: string }
+          example: pi_55e3caceeccd43fa80cde32d642ec100
+      responses:
+        "200":
+          description: The recorded status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentIntent" }
+        "404":
+          description: "`payment_intent_not_found` — this service has no record of that intent."
+          $ref: "#/components/responses/Error"
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /events:
+    get:
+      tags: [Webhooks]
+      summary: The event log — and how a business reconciles what it missed
+      operationId: listEvents
+      description: |
+        Each entry is **byte for byte the body that was, or would have been, delivered**, so
+        catching up here and receiving a webhook are the same information arriving two ways.
+
+        Poll with the id of the last event already processed. `id` is a uuidv7 and its leading
+        bits are a timestamp, so ordering by primary key *is* ordering by creation time and
+        `after` is a cursor rather than an offset — a page cannot shift under a caller midway
+        through reading it.
+
+        A pull, deliberately, rather than a redelivery endpoint: it also covers events raised
+        before any endpoint was configured, which have no delivery rows to replay.
+      security: [{ operatorToken: [] }]
+      parameters:
+        - name: after
+          in: query
+          required: false
+          description: Return only events newer than this id.
+          schema: { type: string, format: uuid }
+        - name: type
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/EventType" }
+        - name: limit
+          in: query
+          required: false
+          description: 1–1000. Asking for more is refused rather than quietly capped.
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        "200":
+          description: Matching events, oldest first. `[]` when nothing is newer — not a 404.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Event" }
+        "400":
+          description: "`invalid_after` — not a uuid. `invalid_limit` — outside 1–1000."
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /webhook_endpoints:
+    get:
+      tags: [Webhooks]
+      summary: List registered receivers
+      operationId: listWebhookEndpoints
+      description: |
+        Read-only. **Registration is configuration**, not an API: endpoints are synced from the
+        `WEBHOOK_ENDPOINTS` environment variable at every startup, so the set is reviewable and
+        deploys with the service. There is nothing here to create one with. Secrets are never
+        returned.
+
+        A URL dropped from the configuration is disabled rather than deleted, because deliveries
+        reference it and their history is worth more than a tidy table.
+      security: [{ operatorToken: [] }]
+      responses:
+        "200":
+          description: Every endpoint, enabled or not, ordered by id.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/WebhookEndpoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /webhook_deliveries:
+    get:
+      tags: [Webhooks]
+      summary: How delivery went, per event per endpoint
+      operationId: listWebhookDeliveries
+      description: |
+        One row per (event, endpoint) — the unit of retrying. Two endpoints failing independently
+        is two rows failing independently.
+
+        Filter on `status=exhausted` to find what a business was owed and never got.
+      security: [{ operatorToken: [] }]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/DeliveryStatus" }
+        - name: event_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: endpoint_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Matching deliveries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/WebhookDelivery" }
+        "400":
+          description: "`invalid_filter` — a filter value is not a uuid, or not a known status."
+          $ref: "#/components/responses/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /openapi.yaml:
+    get:
+      tags: [Documentation]
+      summary: This description
+      operationId: openapiSpec
+      security: []
+      description: |
+        Embedded at compile time with `include_str!`, the same way `sqlx::migrate!()` embeds the
+        migrations — the runtime image is distroless and holds no files, so a spec read from
+        disk would not be there to read.
+      responses:
+        "200":
+          description: The OpenAPI 3.1 description of this service.
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /docs:
+    get:
+      tags: [Documentation]
+      summary: Browsable API reference
+      operationId: docs
+      security: []
+      description: |
+        Swagger UI, with its assets vendored into the binary rather than fetched from a CDN, so
+        the reference is readable on a machine with no route to the internet. Redirects to
+        `/docs/`, where the relative asset paths resolve.
+      responses:
+        "303":
+          description: Redirect to `/docs/`, which serves the viewer.
+          headers:
+            location:
+              schema: { type: string, const: /docs/ }
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness
+      operationId: health
+      description: Open, and it has to be — the container healthcheck carries no headers at all.
+      security: []
+      responses:
+        "200":
+          description: Alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+                required: [status]
+
+components:
+  securitySchemes:
+    operatorToken:
+      type: apiKey
+      in: header
+      name: X-API-Token
+      description: |
+        One shared static token, compared in constant time. A missing token and a wrong one get
+        the same `401`.
+
+  parameters:
+    CustomerId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    InvoiceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Error:
+      description: A failure, in the standard shape.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: "`unauthorized` — no token, or the wrong one."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: unauthorized }
+    Internal:
+      description: "`internal_error`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: internal_error }
+    InvoiceMoved:
+      description: The invoice, in its new state.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Invoice" }
+
+  schemas:
+    Error:
+      type: object
+      description: The shape every failure answers with, bar the two documented exceptions.
+      properties:
+        error:
+          type: string
+          description: A stable machine-readable code. Never prose.
+          example: invoice_not_payable
+      required: [error]
+
+    CreateCustomer:
+      type: object
+      properties:
+        name: { type: string, minLength: 1 }
+        email:
+          type: string
+          minLength: 1
+          description: Unique across customers. Trimmed, not otherwise validated.
+      required: [name, email]
+
+    Customer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+      required: [id, name, email]
+
+    InvoiceState:
+      type: string
+      enum: [draft, ready, processing, processed, void]
+      description: |
+        `draft` — being prepared, editable.
+        `ready` — finalized and payable.
+        `processing` — a charge is in flight; no operator endpoint can move it.
+        `processed` — paid. Terminal.
+        `void` — written off. Terminal.
+
+    LineItem:
+      type: object
+      description: Input to the total, then discarded. Not persisted and never returned.
+      properties:
+        description: { type: string, minLength: 1 }
+        quantity:
+          type: integer
+          minimum: 1
+          description: Must be positive — a zero-quantity line says nothing and is likelier a bug.
+        unit_amount_cents:
+          type: integer
+          minimum: 0
+          description: Zero is allowed; a comped line still belongs on the invoice.
+      required: [description, quantity, unit_amount_cents]
+
+    CreateInvoice:
+      type: object
+      properties:
+        customer_id: { type: string, format: uuid }
+        due_date:
+          type: string
+          format: date
+          description: Exactly `YYYY-MM-DD`. Other formats are refused rather than guessed at.
+        line_items:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/LineItem" }
+      required: [customer_id, due_date, line_items]
+
+    Invoice:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        customer_id: { type: string, format: uuid }
+        total_cents:
+          type: integer
+          minimum: 0
+          description: Minor units, summed from the line items by the server.
+        due_date: { type: string, format: date }
+        state: { $ref: "#/components/schemas/InvoiceState" }
+      required: [id, customer_id, total_cents, due_date, state]
+
+    PayInvoice:
+      type: object
+      properties:
+        card_token:
+          type: string
+          description: |
+            A payment service card token. The development stack accepts `tok_success`,
+            `tok_insufficient_funds`, `tok_card_declined`, `tok_timeout` and `tok_network_error`.
+      required: [card_token]
+
+    Attempt:
+      type: object
+      description: |
+        The answer to a charge that reached the payment service: the intent id, and nothing else.
+        Not the invoice — a caller that wants the invoice can read it; what it cannot get anywhere
+        else is the handle to the attempt.
+      properties:
+        payment_intent_id: { type: string, example: pi_55e3caceeccd43fa80cde32d642ec100 }
+      required: [payment_intent_id]
+
+    AttemptError:
+      type: object
+      description: |
+        Any failed charge that reached the payment service: the `402`, the `504` and the `500`.
+        Carries the handle as well as the failure.
+      properties:
+        error: { type: string, enum: [charge_declined, charge_unresolved, internal_error] }
+        payment_intent_id: { type: string }
+      required: [error, payment_intent_id]
+
+    PaymentStatus:
+      type: string
+      enum: [pending, succeeded, failed]
+      description: |
+        `pending` means **this service does not know yet**, not that the card was not charged.
+
+    PaymentIntent:
+      type: object
+      properties:
+        payment_intent_id: { type: string }
+        status: { $ref: "#/components/schemas/PaymentStatus" }
+      required: [payment_intent_id, status]
+
+    EventType:
+      type: string
+      enum: [invoice.created, invoice.paid, invoice.payment_failed]
+      description: A receiver must ignore types it does not recognise; the vocabulary only grows.
+
+    Event:
+      type: object
+      description: The delivered envelope, byte for byte.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Also the `webhook-id` header, and the receiver's deduplication key.
+        type: { $ref: "#/components/schemas/EventType" }
+        created_at: { type: string, format: date-time }
+        data:
+          type: object
+          properties:
+            invoice: { $ref: "#/components/schemas/Invoice" }
+            payment_intent_id:
+              type: string
+              description: Present on `invoice.paid` and `invoice.payment_failed`.
+          required: [invoice]
+      required: [id, type, created_at, data]
+
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        created_at: { type: string, format: date-time }
+        disabled_at:
+          type: [string, "null"]
+          format: date-time
+          description: Set when the URL is no longer in the configuration. Null while enabled.
+      required: [id, url, created_at, disabled_at]
+
+    DeliveryStatus:
+      type: string
+      enum: [pending, succeeded, exhausted]
+      description: Nothing leaves `exhausted` — the retry budget is spent and nothing will try again.
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        event_id: { type: string, format: uuid }
+        endpoint_id: { type: string, format: uuid }
+        event_type:
+          { $ref: "#/components/schemas/EventType" }
+        status: { $ref: "#/components/schemas/DeliveryStatus" }
+        attempts: { type: integer, description: "Out of 8, spread over ~20 h 31 m." }
+        next_attempt_at:
+          type: string
+          format: date-time
+          description: Still set on a finished delivery, where it is simply the last lease taken.
+        last_status:
+          type: [integer, "null"]
+          description: The last response's status. Exactly one of this and `last_error` is ever set.
+        last_error:
+          type: [string, "null"]
+          description: The transport error, when nothing answered at all.
+        delivered_at: { type: [string, "null"], format: date-time }
+      required:
+        [id, event_id, endpoint_id, event_type, status, attempts, next_attempt_at,
+         last_status, last_error, delivered_at]

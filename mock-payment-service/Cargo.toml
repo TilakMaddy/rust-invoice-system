@@ -1,0 +1,19 @@
+[package]
+name = "mock-payment-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+futures-util = { version = "0.3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+# `test-util` provides #[tokio::test(start_paused = true)], which fast-forwards the mock's
+# 30 second `tok_timeout` sleep instead of actually waiting for it.
+tokio = { version = "1", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }

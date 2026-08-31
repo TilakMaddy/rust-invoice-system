@@ -1,0 +1,20 @@
+[package]
+name = "webhook-receiver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+# The same two crates the business signs with. This service exists to prove a receiver can
+# verify what it is sent, so it verifies the way a real one would rather than asking the sender.
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# `time` is what bounds the replay window: the tolerance check compares the signed timestamp
+# against the clock, and nothing else in the crate needs a timer.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
